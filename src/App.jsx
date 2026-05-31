@@ -8,24 +8,40 @@ function formatCode(c) {
   return c.replace(/(\d{5})(\d{4})(\d{4})(\d{4})/, '$1-$2-$3-$4')
 }
 
+function playBeep() {
+  try {
+    const ctx = new AudioContext()
+    const osc = ctx.createOscillator()
+    const gain = ctx.createGain()
+    osc.connect(gain)
+    gain.connect(ctx.destination)
+    osc.frequency.value = 880
+    gain.gain.setValueAtTime(0.3, ctx.currentTime)
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.15)
+    osc.start(ctx.currentTime)
+    osc.stop(ctx.currentTime + 0.15)
+  } catch (e) { /* silent fail if audio blocked */ }
+}
+
 export default function App() {
   const [tab, setTab] = useState('sistema')
   const [sistemaInput, setSistemaInput] = useState('')
   const [sistemaCodes, setSistemaCodes] = useState(new Set())
   const [fisicosCodes, setFisicosCodes] = useState([])
   const [camActive, setCamActive] = useState(false)
-  const [camStatus, setCamStatus] = useState({ type: 'info', msg: 'Presiona "Iniciar cámara" para comenzar a escanear' })
+  const [camStatus, setCamStatus] = useState({ type: 'info', msg: 'Presiona "Iniciar cámara" para comenzar' })
   const [lastScan, setLastScan] = useState(null)
   const [manualInput, setManualInput] = useState('')
   const [isScanning, setIsScanning] = useState(false)
+  const [scanCount, setScanCount] = useState(0)
 
   const videoRef = useRef(null)
   const canvasRef = useRef(null)
   const streamRef = useRef(null)
   const scanIntervalRef = useRef(null)
   const isScanningRef = useRef(false)
+  const workerRef = useRef(null)
 
-  // Parse sistema codes from textarea
   const parseSistema = useCallback((raw) => {
     const tokens = raw.match(/\d{17}/g) || []
     setSistemaCodes(new Set(tokens))
@@ -35,7 +51,23 @@ export default function App() {
     parseSistema(sistemaInput)
   }, [sistemaInput, parseSistema])
 
-  // Add a physical code
+  // Pre-initialize Tesseract worker for speed
+  useEffect(() => {
+    const initWorker = async () => {
+      const worker = await Tesseract.createWorker('eng', 1, {
+        logger: () => {}
+      })
+      await worker.setParameters({
+        tessedit_char_whitelist: '0123456789',
+        tessedit_pageseg_mode: '7',
+        tessedit_ocr_engine_mode: '2',
+      })
+      workerRef.current = worker
+    }
+    initWorker()
+    return () => { workerRef.current?.terminate() }
+  }, [])
+
   const addCode = useCallback((code) => {
     const clean = code.replace(/\D/g, '')
     if (clean.length !== DIGITS) {
@@ -46,37 +78,40 @@ export default function App() {
       if (prev.includes(clean)) { isDup = true; return prev }
       return [...prev, clean].sort()
     })
-    if (isDup) return { ok: false, msg: 'Duplicado ignorado: ' + formatCode(clean) }
-    return { ok: true, msg: 'Agregado: ' + formatCode(clean) }
+    if (isDup) return { ok: false, msg: 'Duplicado: ' + formatCode(clean) }
+    setScanCount(n => n + 1)
+    return { ok: true, msg: formatCode(clean) }
   }, [])
 
   const deleteCode = (idx) => {
     setFisicosCodes(prev => prev.filter((_, i) => i !== idx))
+    setScanCount(n => Math.max(0, n - 1))
   }
 
   const clearFisicos = () => {
-    if (!window.confirm('¿Eliminar todos los códigos físicos escaneados?')) return
+    if (!window.confirm('¿Eliminar todos los códigos físicos?')) return
     setFisicosCodes([])
     setLastScan(null)
+    setScanCount(0)
   }
 
-  // Camera
   const startCamera = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
+        video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } }
       }).catch(() => navigator.mediaDevices.getUserMedia({ video: true }))
 
       streamRef.current = stream
       if (videoRef.current) videoRef.current.srcObject = stream
       setCamActive(true)
-      setCamStatus({ type: 'success', msg: 'Cámara activa. Escaneo automático cada 2 seg, o presiona "Capturar".' })
+      setCamStatus({ type: 'success', msg: 'Cámara activa — escaneando automáticamente' })
 
+      // Auto-scan every 800ms for fast detection
       scanIntervalRef.current = setInterval(() => {
         if (!isScanningRef.current) captureFrameAuto()
-      }, 2000)
+      }, 800)
     } catch (e) {
-      setCamStatus({ type: 'warn', msg: 'No se pudo acceder a la cámara: ' + e.message })
+      setCamStatus({ type: 'warn', msg: 'Error cámara: ' + e.message })
     }
   }
 
@@ -91,7 +126,7 @@ export default function App() {
     }
     if (videoRef.current) videoRef.current.srcObject = null
     setCamActive(false)
-    setCamStatus({ type: 'info', msg: 'Presiona "Iniciar cámara" para comenzar a escanear' })
+    setCamStatus({ type: 'info', msg: 'Presiona "Iniciar cámara" para comenzar' })
   }
 
   useEffect(() => () => stopCamera(), [])
@@ -99,48 +134,66 @@ export default function App() {
   const processFrame = async (auto = false) => {
     const video = videoRef.current
     const canvas = canvasRef.current
-    if (!video || !video.videoWidth) return
+    if (!video || !video.videoWidth || !workerRef.current) return
 
     isScanningRef.current = true
     setIsScanning(true)
-    if (!auto) setCamStatus({ type: 'info', msg: 'Procesando imagen...' })
 
     const vw = video.videoWidth, vh = video.videoHeight
-    const cropW = Math.floor(vw * 0.87), cropH = Math.floor(vh * 0.23)
-    const cropX = Math.floor((vw - cropW) / 2), cropY = Math.floor((vh - cropH) / 2)
+    // Wider crop to catch full 17-digit codes
+    const cropW = Math.floor(vw * 0.92)
+    const cropH = Math.floor(vh * 0.20)
+    const cropX = Math.floor((vw - cropW) / 2)
+    const cropY = Math.floor((vh - cropH) / 2)
 
-    canvas.width = cropW
-    canvas.height = cropH
+    // Scale up 2x for better OCR accuracy
+    const scale = 2
+    canvas.width = cropW * scale
+    canvas.height = cropH * scale
     const ctx = canvas.getContext('2d')
-    ctx.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH)
+    ctx.imageSmoothingEnabled = false
+    ctx.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, cropW * scale, cropH * scale)
 
-    // Binarize for better OCR
-    const imgData = ctx.getImageData(0, 0, cropW, cropH)
+    // High-contrast binarization with adaptive threshold
+    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height)
     const d = imgData.data
+    // Calculate average brightness for adaptive threshold
+    let sum = 0
+    for (let i = 0; i < d.length; i += 4) sum += d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114
+    const avg = sum / (d.length / 4)
+    const threshold = Math.min(Math.max(avg * 0.85, 80), 180)
+
     for (let i = 0; i < d.length; i += 4) {
-      const gray = d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114
-      const v = gray > 128 ? 255 : 0
-      d[i] = d[i + 1] = d[i + 2] = v
+      const gray = d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114
+      const v = gray > threshold ? 255 : 0
+      d[i] = d[i+1] = d[i+2] = v
     }
     ctx.putImageData(imgData, 0, 0)
 
     try {
-      const result = await Tesseract.recognize(canvas, 'eng', {
-        tessedit_char_whitelist: '0123456789 ',
-        tessedit_pageseg_mode: '7',
-      })
-      const raw = result.data.text.replace(/\s/g, '')
-      const matches = raw.match(/\d{17}/g)
+      const result = await workerRef.current.recognize(canvas)
+      const raw = result.data.text.replace(/\D/g, '')
+      // Try to find 17-digit sequence, also handle slight misreads (16-18 digits)
+      const matches = raw.match(/\d{17}/g) || raw.match(/\d{16,18}/g)
 
       if (matches && matches.length > 0) {
-        const res = addCode(matches[0])
-        setCamStatus({ type: res.ok ? 'success' : 'warn', msg: res.ok ? '✓ ' + res.msg : res.msg })
-        if (res.ok) setLastScan(formatCode(matches[0]))
-      } else if (!auto) {
-        setCamStatus({ type: 'warn', msg: 'No se detectó código de 17 dígitos. Ajusta la posición e iluminación.' })
+        const candidate = matches[0].length === 17
+          ? matches[0]
+          : matches.find(m => m.length === 17) || matches[0]
+
+        if (candidate.length === 17) {
+          const res = addCode(candidate)
+          if (res.ok) {
+            playBeep()
+            setLastScan(res.msg)
+            setCamStatus({ type: 'success', msg: '✓ Capturado: ' + res.msg })
+          } else if (res.msg.startsWith('Duplicado')) {
+            setCamStatus({ type: 'warn', msg: '⚠ ' + res.msg })
+          }
+        }
       }
     } catch (e) {
-      if (!auto) setCamStatus({ type: 'warn', msg: 'Error OCR: ' + e.message })
+      // silent fail on auto scan
     }
 
     isScanningRef.current = false
@@ -152,7 +205,7 @@ export default function App() {
 
   const handleManualAdd = () => {
     const res = addCode(manualInput)
-    setCamStatus({ type: res.ok ? 'success' : 'warn', msg: res.msg })
+    setCamStatus({ type: res.ok ? 'success' : 'warn', msg: res.ok ? '✓ Agregado: ' + res.msg : res.msg })
     if (res.ok) setManualInput('')
   }
 
@@ -183,19 +236,17 @@ export default function App() {
   return (
     <div className="app">
       <div className="header">
-        <h1>📦 Control de Inventario de Tarjetas</h1>
-        <p>Códigos de 17 dígitos — escanea físicos y compara con el sistema</p>
+        <h1>📦 Control de Tarjetas</h1>
+        <p>Códigos de 17 dígitos</p>
       </div>
 
       <div className="tabs">
         {['sistema', 'camara', 'fisicos', 'comparar'].map((t, i) => (
-          <button
-            key={t}
-            className={`tab ${tab === t ? 'active' : ''}`}
-            onClick={() => setTab(t)}
-          >
-            {['1. Sistema', '2. Cámara', '3. Físicos', '4. Comparar'][i]}
-            {t === 'fisicos' && <span className="badge blue">{fisicosCodes.length}</span>}
+          <button key={t} className={`tab ${tab === t ? 'active' : ''}`} onClick={() => setTab(t)}>
+            {['Sistema', 'Cámara', 'Físicos', 'Comparar'][i]}
+            {t === 'fisicos' && fisicosCodes.length > 0 && (
+              <span className="badge blue">{fisicosCodes.length}</span>
+            )}
           </button>
         ))}
       </div>
@@ -205,32 +256,27 @@ export default function App() {
         <div className="panel">
           <div className="card">
             <div className="card-title">
-              <i className="ti ti-database" aria-hidden="true" /> Códigos del sistema (17 dígitos cada uno)
+              <i className="ti ti-database" aria-hidden="true" /> Códigos del sistema
+              {sistemaCodes.size > 0 && <span className="count-badge">{sistemaCodes.size}</span>}
             </div>
             <textarea
               value={sistemaInput}
               onChange={e => setSistemaInput(e.target.value)}
-              placeholder={`Pega aquí los códigos del sistema, uno por línea o en masa.\nSe detectan automáticamente los números de 17 dígitos.\n\nEjemplo:\n12345678901234567\n98765432109876543`}
+              placeholder={`Pega aquí los códigos del sistema.\nSe detectan automáticamente los números de 17 dígitos.\n\nEjemplo:\n12345678901234567\n98765432109876543`}
             />
             <div className="btn-row">
-              <button className="btn primary" onClick={() => setTab('camara')}>
-                Continuar → Escanear físicos
+              <button className="btn-big primary" onClick={() => setTab('camara')}>
+                <i className="ti ti-camera" aria-hidden="true" />
+                Ir a escanear físicos
               </button>
               <button className="btn danger" onClick={() => setSistemaInput('')}>
-                Limpiar
+                <i className="ti ti-trash" aria-hidden="true" /> Limpiar
               </button>
             </div>
           </div>
-          <div className="card">
-            <div className="card-title">
-              Códigos cargados del sistema{' '}
-              {sistemaCodes.size > 0 && (
-                <span style={{ color: 'var(--text-tertiary)', fontWeight: 400 }}>({sistemaCodes.size})</span>
-              )}
-            </div>
-            {sistemaCodes.size === 0 ? (
-              <div className="empty-msg">Aún no hay códigos de 17 dígitos detectados</div>
-            ) : (
+          {sistemaCodes.size > 0 && (
+            <div className="card">
+              <div className="card-title">Códigos cargados</div>
               <div className="code-list">
                 {[...sistemaCodes].sort().map((c, i) => (
                   <div className="code-item" key={c}>
@@ -239,8 +285,8 @@ export default function App() {
                   </div>
                 ))}
               </div>
-            )}
-          </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -256,39 +302,64 @@ export default function App() {
             <video ref={videoRef} autoPlay playsInline muted />
             <canvas ref={canvasRef} style={{ display: 'none' }} />
             <div className="cam-overlay">
-              <div className="scan-frame"><div className="scan-line" /></div>
+              <div className={`scan-frame ${isScanning ? 'scanning' : ''}`}>
+                <div className="scan-line" />
+              </div>
               <div className="cam-hint">Centra el código de 17 dígitos en el recuadro</div>
+            </div>
+            {/* Counter overlay */}
+            <div className="cam-counter">
+              <span>{fisicosCodes.length}</span>
+              <small>escaneados</small>
             </div>
           </div>
 
-          <div className="btn-row" style={{ marginTop: '0.75rem' }}>
-            <button className="btn primary" onClick={camActive ? stopCamera : startCamera}>
-              <i className={`ti ${camActive ? 'ti-camera-off' : 'ti-camera'}`} aria-hidden="true" />
-              {camActive ? 'Detener cámara' : 'Iniciar cámara'}
-            </button>
-            <button className="btn" onClick={captureFrameManual} disabled={!camActive || isScanning}>
-              <i className="ti ti-scan" aria-hidden="true" /> Capturar
-            </button>
-            <button className="btn" onClick={() => setTab('fisicos')}>
-              <i className="ti ti-list" aria-hidden="true" /> Ver lista
-            </button>
+          {/* BIG CAPTURE BUTTON */}
+          <div className="capture-zone">
+            {!camActive ? (
+              <button className="btn-capture start" onClick={startCamera}>
+                <i className="ti ti-camera" aria-hidden="true" />
+                <span>INICIAR CÁMARA</span>
+              </button>
+            ) : (
+              <>
+                <button
+                  className={`btn-capture ${isScanning ? 'scanning' : 'ready'}`}
+                  onClick={captureFrameManual}
+                  disabled={isScanning}
+                >
+                  <i className={`ti ${isScanning ? 'ti-loader' : 'ti-scan'}`} aria-hidden="true" />
+                  <span>{isScanning ? 'PROCESANDO...' : 'CAPTURAR'}</span>
+                  <small>o espera — automático cada 0.8s</small>
+                </button>
+                <button className="btn-stop" onClick={stopCamera}>
+                  <i className="ti ti-camera-off" aria-hidden="true" /> Detener
+                </button>
+              </>
+            )}
           </div>
 
           {lastScan && (
-            <div className="cam-status success" style={{ marginTop: '0.5rem' }}>
-              <i className="ti ti-check" aria-hidden="true" /> Último: {lastScan}
+            <div className="last-scan-banner">
+              <i className="ti ti-circle-check" aria-hidden="true" />
+              <div>
+                <small>Último capturado</small>
+                <strong>{lastScan}</strong>
+              </div>
+              <span className="scan-total">{fisicosCodes.length} total</span>
             </div>
           )}
 
           <div className="card" style={{ marginTop: '0.75rem' }}>
             <div className="card-title">
-              <i className="ti ti-keyboard" aria-hidden="true" /> Agregar código manualmente
+              <i className="ti ti-keyboard" aria-hidden="true" /> Ingresar manualmente
             </div>
             <div className="manual-add">
               <input
                 type="text"
+                inputMode="numeric"
                 maxLength={17}
-                placeholder="Ingresa código de 17 dígitos"
+                placeholder="17 dígitos"
                 value={manualInput}
                 onChange={e => setManualInput(e.target.value.replace(/\D/g, ''))}
                 onKeyDown={e => e.key === 'Enter' && handleManualAdd()}
@@ -296,6 +367,10 @@ export default function App() {
               <button className="btn primary" onClick={handleManualAdd}>Agregar</button>
             </div>
           </div>
+
+          <button className="btn-nav-bottom" onClick={() => setTab('fisicos')}>
+            <i className="ti ti-list" aria-hidden="true" /> Ver lista de físicos ({fisicosCodes.length})
+          </button>
         </div>
       )}
 
@@ -318,9 +393,19 @@ export default function App() {
               <div className="stat-label">Diferencia</div>
             </div>
           </div>
+
+          <div className="action-row">
+            <button className="btn-big primary" onClick={() => setTab('camara')}>
+              <i className="ti ti-camera" aria-hidden="true" /> Seguir escaneando
+            </button>
+            <button className="btn-big success" onClick={() => setTab('comparar')}>
+              <i className="ti ti-git-compare" aria-hidden="true" /> Comparar
+            </button>
+          </div>
+
           <div className="card">
             <div className="card-title">
-              <i className="ti ti-list" aria-hidden="true" /> Tarjetas físicas escaneadas (ordenadas menor → mayor)
+              <i className="ti ti-list" aria-hidden="true" /> Tarjetas físicas (menor → mayor)
             </div>
             {fisicosCodes.length === 0 ? (
               <div className="empty-msg">Escanea tarjetas en la pestaña "Cámara"</div>
@@ -337,16 +422,14 @@ export default function App() {
                 ))}
               </div>
             )}
-            <hr className="divider" />
-            <div className="btn-row">
-              <button className="btn" onClick={() => setTab('camara')}>
-                <i className="ti ti-camera" aria-hidden="true" /> Seguir escaneando
-              </button>
-              <button className="btn primary" onClick={() => setTab('comparar')}>
-                <i className="ti ti-git-compare" aria-hidden="true" /> Comparar
-              </button>
-              <button className="btn danger" onClick={clearFisicos}>Limpiar lista</button>
-            </div>
+            {fisicosCodes.length > 0 && (
+              <>
+                <hr className="divider" />
+                <button className="btn danger" onClick={clearFisicos}>
+                  <i className="ti ti-trash" aria-hidden="true" /> Limpiar toda la lista
+                </button>
+              </>
+            )}
           </div>
         </div>
       )}
@@ -377,27 +460,27 @@ export default function App() {
 
               <div className="card">
                 <div className="result-title missing">
-                  <i className="ti ti-alert-circle" aria-hidden="true" /> Faltantes — en el sistema pero no en físicos
+                  <i className="ti ti-alert-circle" aria-hidden="true" /> Faltantes ({missing.length}) — en sistema pero no en físicos
                 </div>
                 {missing.length === 0
-                  ? <div className="no-result">Ninguno</div>
+                  ? <div className="no-result">Ninguno ✓</div>
                   : missing.map(c => <span key={c} className="code-tag missing">{formatCode(c)}</span>)
                 }
               </div>
 
               <div className="card">
                 <div className="result-title extra">
-                  <i className="ti ti-alert-triangle" aria-hidden="true" /> Sobrantes — en físicos pero no en el sistema
+                  <i className="ti ti-alert-triangle" aria-hidden="true" /> Sobrantes ({extra.length}) — en físicos pero no en sistema
                 </div>
                 {extra.length === 0
-                  ? <div className="no-result">Ninguno</div>
+                  ? <div className="no-result">Ninguno ✓</div>
                   : extra.map(c => <span key={c} className="code-tag extra">{formatCode(c)}</span>)
                 }
               </div>
 
               <div className="card">
                 <div className="result-title match">
-                  <i className="ti ti-circle-check" aria-hidden="true" /> Coincidencias
+                  <i className="ti ti-circle-check" aria-hidden="true" /> Coincidencias ({match.length})
                 </div>
                 {match.length === 0
                   ? <div className="no-result">Ninguno</div>
@@ -405,11 +488,9 @@ export default function App() {
                 }
               </div>
 
-              <div className="btn-row">
-                <button className="btn" onClick={exportResults}>
-                  <i className="ti ti-download" aria-hidden="true" /> Exportar .txt
-                </button>
-              </div>
+              <button className="btn-big" onClick={exportResults}>
+                <i className="ti ti-download" aria-hidden="true" /> Exportar reporte .txt
+              </button>
             </>
           )}
         </div>
